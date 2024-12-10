@@ -1,17 +1,9 @@
 declare module '*.svelte' {
 	// use prettier-ignore for a while because of https://github.com/sveltejs/language-tools/commit/026111228b5814a9109cc4d779d37fb02955fb8b
 	// prettier-ignore
-	import { SvelteComponent, Component, type ComponentConstructorOptions } from 'svelte'
-
-	// Support using the component as both a class and function during the transition period
-	// prettier-ignore
-	interface ComponentType {
-		(
-			...args: Parameters<Component<Record<string, any>>>
-		): ReturnType<Component<Record<string, any>, Record<string, any>>>
-		new (o: ComponentConstructorOptions): SvelteComponent
-	}
-	const Comp: ComponentType;
+	import { SvelteComponent } from 'svelte'
+	import { LegacyComponentType } from 'svelte/legacy';
+	const Comp: LegacyComponentType;
 	type Comp = SvelteComponent;
 	export default Comp;
 }
@@ -47,7 +39,7 @@ declare namespace $state {
 		| BigInt64Array
 		| BigUint64Array;
 
-	/** The things that `structuredClone` can handle — https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Structured_clone_algorithm */
+	/** The things that `structuredClone` can handle — https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Structured_clone_algorithm */
 	export type Cloneable =
 		| ArrayBuffer
 		| DataView
@@ -358,7 +350,7 @@ declare function $props(): any;
 declare function $bindable<T>(fallback?: T): T;
 
 /**
- * Inspects one or more values whenever they, or the properties they contain, change. Example:
+ * Inspects one or more values whenever they, or the properties they contain, change. Example:
  *
  * ```ts
  * $inspect(someValue, someOtherValue)
