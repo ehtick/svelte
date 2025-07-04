@@ -112,6 +112,45 @@ describe('signals', () => {
 		};
 	});
 
+	test('unowned deriveds are not added as reactions but trigger effects', () => {
+		var obj = state<any>(undefined);
+
+		class C1 {
+			#v = state(0);
+			get v() {
+				return $.get(this.#v);
+			}
+			set v(v: number) {
+				set(this.#v, v);
+			}
+		}
+
+		return () => {
+			let d = derived(() => $.get(obj)?.v || '-');
+
+			const log: number[] = [];
+			assert.equal($.get(d), '-');
+
+			let destroy = effect_root(() => {
+				render_effect(() => {
+					log.push($.get(d));
+				});
+			});
+
+			set(obj, new C1());
+			flushSync();
+			assert.equal($.get(d), '-');
+			$.get(obj).v = 1;
+			flushSync();
+			assert.equal($.get(d), 1);
+			assert.deepEqual(log, ['-', 1]);
+			destroy();
+			// ensure we're not leaking reactions
+			assert.equal(obj.reactions, null);
+			assert.equal(d.reactions, null);
+		};
+	});
+
 	test('derived from state', () => {
 		const log: number[] = [];
 
@@ -1018,6 +1057,41 @@ describe('signals', () => {
 
 		return () => {
 			flushSync();
+		};
+	});
+
+	test('nested effects depend on state of upper effects', () => {
+		const logs: number[] = [];
+
+		user_effect(() => {
+			const raw = state(0);
+			const proxied = proxy({ current: 0 });
+
+			// We need those separate, else one working and rerunning the effect
+			// could mask the other one not rerunning
+			user_effect(() => {
+				logs.push($.get(raw));
+			});
+
+			user_effect(() => {
+				logs.push(proxied.current);
+			});
+
+			// Important so that the updating effect is not running
+			// together with the reading effects
+			flushSync();
+
+			user_effect(() => {
+				$.untrack(() => {
+					set(raw, $.get(raw) + 1);
+					proxied.current += 1;
+				});
+			});
+		});
+
+		return () => {
+			flushSync();
+			assert.deepEqual(logs, [0, 0, 1, 1]);
 		};
 	});
 

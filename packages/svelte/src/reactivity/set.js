@@ -1,6 +1,7 @@
 /** @import { Source } from '#client' */
 import { DEV } from 'esm-env';
-import { source, set } from '../internal/client/reactivity/sources.js';
+import { source, set, state } from '../internal/client/reactivity/sources.js';
+import { label, tag } from '../internal/client/dev/tracing.js';
 import { get } from '../internal/client/runtime.js';
 import { increment } from './utils.js';
 
@@ -47,8 +48,8 @@ var inited = false;
 export class SvelteSet extends Set {
 	/** @type {Map<T, Source<boolean>>} */
 	#sources = new Map();
-	#version = source(0);
-	#size = source(0);
+	#version = state(0);
+	#size = state(0);
 
 	/**
 	 * @param {Iterable<T> | null | undefined} [value]
@@ -56,8 +57,13 @@ export class SvelteSet extends Set {
 	constructor(value) {
 		super();
 
-		// If the value is invalid then the native exception will fire here
-		if (DEV) value = new Set(value);
+		if (DEV) {
+			// If the value is invalid then the native exception will fire here
+			value = new Set(value);
+
+			tag(this.#version, 'SvelteSet version');
+			tag(this.#size, 'SvelteSet.size');
+		}
 
 		if (value) {
 			for (var element of value) {
@@ -111,6 +117,11 @@ export class SvelteSet extends Set {
 			}
 
 			s = source(true);
+
+			if (DEV) {
+				tag(s, `SvelteSet has(${label(value)})`);
+			}
+
 			sources.set(value, s);
 		}
 
