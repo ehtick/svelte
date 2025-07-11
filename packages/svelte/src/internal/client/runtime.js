@@ -1,4 +1,4 @@
-/** @import { ComponentContext, Derived, Effect, Reaction, Signal, Source, Value } from '#client' */
+/** @import { Derived, Effect, Reaction, Signal, Source, Value } from '#client' */
 import { DEV } from 'esm-env';
 import { define_property, get_descriptors, get_prototype_of, index_of } from '../shared/utils.js';
 import {
@@ -20,31 +20,29 @@ import {
 	STATE_SYMBOL,
 	BLOCK_EFFECT,
 	ROOT_EFFECT,
-	LEGACY_DERIVED_PROP,
 	DISCONNECTED,
-	BOUNDARY_EFFECT,
-	EFFECT_IS_UPDATING
+	EFFECT_IS_UPDATING,
+	STALE_REACTION,
+	USER_EFFECT
 } from './constants.js';
 import { flush_tasks } from './dom/task.js';
 import { internal_set, old_values } from './reactivity/sources.js';
-import { destroy_derived_effects, update_derived } from './reactivity/deriveds.js';
+import { destroy_derived_effects, execute_derived, update_derived } from './reactivity/deriveds.js';
 import * as e from './errors.js';
-import { FILENAME } from '../../constants.js';
+
 import { tracing_mode_flag } from '../flags/index.js';
 import { tracing_expressions, get_stack } from './dev/tracing.js';
 import {
 	component_context,
 	dev_current_component_function,
+	dev_stack,
 	is_runes,
 	set_component_context,
-	set_dev_current_component_function
+	set_dev_current_component_function,
+	set_dev_stack
 } from './context.js';
-import { is_firefox } from './dom/operations.js';
-
-// Used for DEV time error handling
-/** @param {WeakSet<Error>} value */
-const handled_errors = new WeakSet();
-let is_throwing_error = false;
+import { handle_error, invoke_error_boundary } from './error-handling.js';
+import { UNINITIALIZED } from '../../constants.js';
 
 let is_flushing = false;
 
@@ -89,18 +87,18 @@ export function set_active_effect(effect) {
 
 /**
  * When sources are created within a reaction, reading and writing
- * them should not cause a re-run
+ * them within that reaction should not cause a re-run
  * @type {null | Source[]}
  */
-export let reaction_sources = null;
+export let current_sources = null;
 
 /** @param {Value} value */
 export function push_reaction_value(value) {
 	if (active_reaction !== null && active_reaction.f & EFFECT_IS_UPDATING) {
-		if (reaction_sources === null) {
-			reaction_sources = [value];
+		if (current_sources === null) {
+			current_sources = [value];
 		} else {
-			reaction_sources.push(value);
+			current_sources.push(value);
 		}
 	}
 }
@@ -135,6 +133,13 @@ let write_version = 1;
 
 /** @type {number} Used to version each read of a source of derived to avoid duplicating depedencies inside a reaction */
 let read_version = 0;
+
+export let update_version = read_version;
+
+/** @param {number} value */
+export function set_update_version(value) {
+	update_version = value;
+}
 
 // If we are working with a get() chain that has no active container,
 // to prevent memory leaks, we skip adding the reaction.
@@ -228,131 +233,6 @@ export function check_dirtiness(reaction) {
 }
 
 /**
- * @param {unknown} error
- * @param {Effect} effect
- */
-function propagate_error(error, effect) {
-	/** @type {Effect | null} */
-	var current = effect;
-
-	while (current !== null) {
-		if ((current.f & BOUNDARY_EFFECT) !== 0) {
-			try {
-				// @ts-expect-error
-				current.fn(error);
-				return;
-			} catch {
-				// Remove boundary flag from effect
-				current.f ^= BOUNDARY_EFFECT;
-			}
-		}
-
-		current = current.parent;
-	}
-
-	is_throwing_error = false;
-	throw error;
-}
-
-/**
- * @param {Effect} effect
- */
-function should_rethrow_error(effect) {
-	return (
-		(effect.f & DESTROYED) === 0 &&
-		(effect.parent === null || (effect.parent.f & BOUNDARY_EFFECT) === 0)
-	);
-}
-
-export function reset_is_throwing_error() {
-	is_throwing_error = false;
-}
-
-/**
- * @param {unknown} error
- * @param {Effect} effect
- * @param {Effect | null} previous_effect
- * @param {ComponentContext | null} component_context
- */
-export function handle_error(error, effect, previous_effect, component_context) {
-	if (is_throwing_error) {
-		if (previous_effect === null) {
-			is_throwing_error = false;
-		}
-
-		if (should_rethrow_error(effect)) {
-			throw error;
-		}
-
-		return;
-	}
-
-	if (previous_effect !== null) {
-		is_throwing_error = true;
-	}
-
-	if (DEV && component_context !== null && error instanceof Error && !handled_errors.has(error)) {
-		handled_errors.add(error);
-
-		const component_stack = [];
-
-		const effect_name = effect.fn?.name;
-
-		if (effect_name) {
-			component_stack.push(effect_name);
-		}
-
-		/** @type {ComponentContext | null} */
-		let current_context = component_context;
-
-		while (current_context !== null) {
-			/** @type {string} */
-			var filename = current_context.function?.[FILENAME];
-
-			if (filename) {
-				const file = filename.split('/').pop();
-				component_stack.push(file);
-			}
-
-			current_context = current_context.p;
-		}
-
-		const indent = is_firefox ? '  ' : '\t';
-		define_property(error, 'message', {
-			value:
-				error.message + `\n${component_stack.map((name) => `\n${indent}in ${name}`).join('')}\n`
-		});
-		define_property(error, 'component_stack', {
-			value: component_stack
-		});
-
-		const stack = error.stack;
-
-		// Filter out internal files from callstack
-		if (stack) {
-			const lines = stack.split('\n');
-			const new_lines = [];
-			for (let i = 0; i < lines.length; i++) {
-				const line = lines[i];
-				if (line.includes('svelte/src/internal')) {
-					continue;
-				}
-				new_lines.push(line);
-			}
-			define_property(error, 'stack', {
-				value: new_lines.join('\n')
-			});
-		}
-	}
-
-	propagate_error(error, effect);
-
-	if (should_rethrow_error(effect)) {
-		throw error;
-	}
-}
-
-/**
  * @param {Value} signal
  * @param {Effect} effect
  * @param {boolean} [root]
@@ -361,10 +241,12 @@ function schedule_possible_effect_self_invalidation(signal, effect, root = true)
 	var reactions = signal.reactions;
 	if (reactions === null) return;
 
+	if (current_sources?.includes(signal)) {
+		return;
+	}
+
 	for (var i = 0; i < reactions.length; i++) {
 		var reaction = reactions[i];
-
-		if (reaction_sources?.includes(signal)) continue;
 
 		if ((reaction.f & DERIVED) !== 0) {
 			schedule_possible_effect_self_invalidation(/** @type {Derived} */ (reaction), effect, false);
@@ -379,20 +261,17 @@ function schedule_possible_effect_self_invalidation(signal, effect, root = true)
 	}
 }
 
-/**
- * @template V
- * @param {Reaction} reaction
- * @returns {V}
- */
+/** @param {Reaction} reaction */
 export function update_reaction(reaction) {
 	var previous_deps = new_deps;
 	var previous_skipped_deps = skipped_deps;
 	var previous_untracked_writes = untracked_writes;
 	var previous_reaction = active_reaction;
 	var previous_skip_reaction = skip_reaction;
-	var previous_reaction_sources = reaction_sources;
+	var previous_sources = current_sources;
 	var previous_component_context = component_context;
 	var previous_untracking = untracking;
+	var previous_update_version = update_version;
 
 	var flags = reaction.f;
 
@@ -403,12 +282,17 @@ export function update_reaction(reaction) {
 		(flags & UNOWNED) !== 0 && (untracking || !is_updating_effect || active_reaction === null);
 	active_reaction = (flags & (BRANCH_EFFECT | ROOT_EFFECT)) === 0 ? reaction : null;
 
-	reaction_sources = null;
+	current_sources = null;
 	set_component_context(reaction.ctx);
 	untracking = false;
-	read_version++;
+	update_version = ++read_version;
 
 	reaction.f |= EFFECT_IS_UPDATING;
+
+	if (reaction.ac !== null) {
+		reaction.ac.abort(STALE_REACTION);
+		reaction.ac = null;
+	}
 
 	try {
 		var result = /** @type {Function} */ (0, reaction.fn)();
@@ -428,7 +312,12 @@ export function update_reaction(reaction) {
 				reaction.deps = deps = new_deps;
 			}
 
-			if (!skip_reaction) {
+			if (
+				!skip_reaction ||
+				// Deriveds that already have reactions can cleanup, so we still add them as reactions
+				((flags & DERIVED) !== 0 &&
+					/** @type {import('#client').Derived} */ (reaction).reactions !== null)
+			) {
 				for (i = skipped_deps; i < deps.length; i++) {
 					(deps[i].reactions ??= []).push(reaction);
 				}
@@ -473,15 +362,18 @@ export function update_reaction(reaction) {
 		}
 
 		return result;
+	} catch (error) {
+		handle_error(error);
 	} finally {
 		new_deps = previous_deps;
 		skipped_deps = previous_skipped_deps;
 		untracked_writes = previous_untracked_writes;
 		active_reaction = previous_reaction;
 		skip_reaction = previous_skip_reaction;
-		reaction_sources = previous_reaction_sources;
+		current_sources = previous_sources;
 		set_component_context(previous_component_context);
 		untracking = previous_untracking;
+		update_version = previous_update_version;
 
 		reaction.f ^= EFFECT_IS_UPDATING;
 	}
@@ -558,7 +450,6 @@ export function update_effect(effect) {
 	set_signal_status(effect, CLEAN);
 
 	var previous_effect = active_effect;
-	var previous_component_context = component_context;
 	var was_updating_effect = is_updating_effect;
 
 	active_effect = effect;
@@ -567,6 +458,9 @@ export function update_effect(effect) {
 	if (DEV) {
 		var previous_component_fn = dev_current_component_function;
 		set_dev_current_component_function(effect.component_function);
+		var previous_stack = /** @type {any} */ (dev_stack);
+		// only block effects have a dev stack, keep the current one otherwise
+		set_dev_stack(effect.dev_stack ?? dev_stack);
 	}
 
 	try {
@@ -581,19 +475,13 @@ export function update_effect(effect) {
 		effect.teardown = typeof teardown === 'function' ? teardown : null;
 		effect.wv = write_version;
 
-		var deps = effect.deps;
-
-		// In DEV, we need to handle a case where $inspect.trace() might
-		// incorrectly state a source dependency has not changed when it has.
-		// That's beacuse that source was changed by the same effect, causing
-		// the versions to match. We can avoid this by incrementing the version
-		if (DEV && tracing_mode_flag && (effect.f & DIRTY) !== 0 && deps !== null) {
-			for (let i = 0; i < deps.length; i++) {
-				var dep = deps[i];
-				if (dep.trace_need_increase) {
+		// In DEV, increment versions of any sources that were written to during the effect,
+		// so that they are correctly marked as dirty when the effect re-runs
+		if (DEV && tracing_mode_flag && (effect.f & DIRTY) !== 0 && effect.deps !== null) {
+			for (var dep of effect.deps) {
+				if (dep.set_during_effect) {
 					dep.wv = increment_write_version();
-					dep.trace_need_increase = undefined;
-					dep.trace_v = undefined;
+					dep.set_during_effect = false;
 				}
 			}
 		}
@@ -601,14 +489,13 @@ export function update_effect(effect) {
 		if (DEV) {
 			dev_effect_stack.push(effect);
 		}
-	} catch (error) {
-		handle_error(error, effect, previous_effect, previous_component_context || effect.ctx);
 	} finally {
 		is_updating_effect = was_updating_effect;
 		active_effect = previous_effect;
 
 		if (DEV) {
 			set_dev_current_component_function(previous_component_fn);
+			set_dev_stack(previous_stack);
 		}
 	}
 }
@@ -637,14 +524,14 @@ function infinite_loop_guard() {
 		if (last_scheduled_effect !== null) {
 			if (DEV) {
 				try {
-					handle_error(error, last_scheduled_effect, null, null);
+					invoke_error_boundary(error, last_scheduled_effect);
 				} catch (e) {
 					// Only log the effect stack if the error is re-thrown
 					log_effect_stack();
 					throw e;
 				}
 			} else {
-				handle_error(error, last_scheduled_effect, null, null);
+				invoke_error_boundary(error, last_scheduled_effect);
 			}
 		} else {
 			if (DEV) {
@@ -701,29 +588,37 @@ function flush_queued_effects(effects) {
 		var effect = effects[i];
 
 		if ((effect.f & (DESTROYED | INERT)) === 0) {
-			try {
-				if (check_dirtiness(effect)) {
-					update_effect(effect);
+			if (check_dirtiness(effect)) {
+				var wv = write_version;
 
-					// Effects with no dependencies or teardown do not get added to the effect tree.
-					// Deferred effects (e.g. `$effect(...)`) _are_ added to the tree because we
-					// don't know if we need to keep them until they are executed. Doing the check
-					// here (rather than in `update_effect`) allows us to skip the work for
-					// immediate effects.
-					if (effect.deps === null && effect.first === null && effect.nodes_start === null) {
-						if (effect.teardown === null) {
-							// remove this effect from the graph
-							unlink_effect(effect);
-						} else {
-							// keep the effect in the graph, but free up some memory
-							effect.fn = null;
-						}
+				update_effect(effect);
+
+				// Effects with no dependencies or teardown do not get added to the effect tree.
+				// Deferred effects (e.g. `$effect(...)`) _are_ added to the tree because we
+				// don't know if we need to keep them until they are executed. Doing the check
+				// here (rather than in `update_effect`) allows us to skip the work for
+				// immediate effects.
+				if (effect.deps === null && effect.first === null && effect.nodes_start === null) {
+					if (effect.teardown === null) {
+						// remove this effect from the graph
+						unlink_effect(effect);
+					} else {
+						// keep the effect in the graph, but free up some memory
+						effect.fn = null;
 					}
 				}
-			} catch (error) {
-				handle_error(error, effect, null, effect.ctx);
+
+				// if state is written in a user effect, abort and re-schedule, lest we run
+				// effects that should be removed as a result of the state change
+				if (write_version > wv && (effect.f & USER_EFFECT) !== 0) {
+					break;
+				}
 			}
 		}
+	}
+
+	for (; i < length; i += 1) {
+		schedule_effect(effects[i]);
 	}
 }
 
@@ -780,12 +675,8 @@ function process_effects(root) {
 			} else if (is_branch) {
 				effect.f ^= CLEAN;
 			} else {
-				try {
-					if (check_dirtiness(effect)) {
-						update_effect(effect);
-					}
-				} catch (error) {
-					handle_error(error, effect, null, effect.ctx);
+				if (check_dirtiness(effect)) {
+					update_effect(effect);
 				}
 			}
 
@@ -823,18 +714,28 @@ export function flushSync(fn) {
 	if (fn) {
 		is_flushing = true;
 		flush_queued_root_effects();
+
+		is_flushing = true;
 		result = fn();
 	}
 
-	flush_tasks();
+	while (true) {
+		flush_tasks();
 
-	while (queued_root_effects.length > 0) {
+		if (queued_root_effects.length === 0) {
+			// this would be reset in `flush_queued_root_effects` but since we are early returning here,
+			// we need to reset it here as well in case the first time there's 0 queued root effects
+			is_flushing = false;
+			last_scheduled_effect = null;
+			if (DEV) {
+				dev_effect_stack = [];
+			}
+			return /** @type {T} */ (result);
+		}
+
 		is_flushing = true;
 		flush_queued_root_effects();
-		flush_tasks();
 	}
-
-	return /** @type {T} */ (result);
 }
 
 /**
@@ -863,7 +764,7 @@ export function get(signal) {
 
 	// Register the dependency on the current reaction signal.
 	if (active_reaction !== null && !untracking) {
-		if (!reaction_sources?.includes(signal)) {
+		if (!current_sources?.includes(signal)) {
 			var deps = active_reaction.deps;
 			if (signal.rv < read_version) {
 				signal.rv = read_version;
@@ -898,7 +799,7 @@ export function get(signal) {
 		}
 	}
 
-	if (is_derived) {
+	if (is_derived && !is_destroying_effect) {
 		derived = /** @type {Derived} */ (signal);
 
 		if (check_dirtiness(derived)) {
@@ -909,30 +810,76 @@ export function get(signal) {
 	if (
 		DEV &&
 		tracing_mode_flag &&
+		!untracking &&
 		tracing_expressions !== null &&
 		active_reaction !== null &&
 		tracing_expressions.reaction === active_reaction
 	) {
 		// Used when mapping state between special blocks like `each`
-		if (signal.debug) {
-			signal.debug();
-		} else if (signal.created) {
-			var entry = tracing_expressions.entries.get(signal);
+		if (signal.trace) {
+			signal.trace();
+		} else {
+			var trace = get_stack('TracedAt');
 
-			if (entry === undefined) {
-				entry = { read: [] };
-				tracing_expressions.entries.set(signal, entry);
+			if (trace) {
+				var entry = tracing_expressions.entries.get(signal);
+
+				if (entry === undefined) {
+					entry = { traces: [] };
+					tracing_expressions.entries.set(signal, entry);
+				}
+
+				var last = entry.traces[entry.traces.length - 1];
+
+				// traces can be duplicated, e.g. by `snapshot` invoking both
+				// both `getOwnPropertyDescriptor` and `get` traps at once
+				if (trace.stack !== last?.stack) {
+					entry.traces.push(trace);
+				}
 			}
-
-			entry.read.push(get_stack('TracedAt'));
 		}
 	}
 
-	if (is_destroying_effect && old_values.has(signal)) {
-		return old_values.get(signal);
+	if (is_destroying_effect) {
+		if (old_values.has(signal)) {
+			return old_values.get(signal);
+		}
+
+		if (is_derived) {
+			derived = /** @type {Derived} */ (signal);
+
+			var value = derived.v;
+
+			// if the derived is dirty, or depends on the values that just changed, re-execute
+			if ((derived.f & CLEAN) !== 0 || depends_on_old_values(derived)) {
+				value = execute_derived(derived);
+			}
+
+			old_values.set(derived, value);
+
+			return value;
+		}
 	}
 
 	return signal.v;
+}
+
+/** @param {Derived} derived */
+function depends_on_old_values(derived) {
+	if (derived.v === UNINITIALIZED) return true; // we don't know, so assume the worst
+	if (derived.deps === null) return false;
+
+	for (const dep of derived.deps) {
+		if (old_values.has(dep)) {
+			return true;
+		}
+
+		if ((dep.f & DERIVED) !== 0 && depends_on_old_values(/** @type {Derived} */ (dep))) {
+			return true;
+		}
+	}
+
+	return false;
 }
 
 /**
@@ -980,17 +927,7 @@ export function invalidate_inner_signals(fn) {
 	var captured = capture_signals(() => untrack(fn));
 
 	for (var signal of captured) {
-		// Go one level up because derived signals created as part of props in legacy mode
-		if ((signal.f & LEGACY_DERIVED_PROP) !== 0) {
-			for (const dep of /** @type {Derived} */ (signal).deps || []) {
-				if ((dep.f & DERIVED) === 0) {
-					// Use internal_set instead of set here and below to avoid mutation validation
-					internal_set(dep, dep.v);
-				}
-			}
-		} else {
-			internal_set(signal, signal.v);
-		}
+		internal_set(signal, signal.v);
 	}
 }
 

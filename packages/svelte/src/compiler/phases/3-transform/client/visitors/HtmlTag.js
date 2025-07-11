@@ -1,17 +1,17 @@
-/** @import { Expression } from 'estree' */
 /** @import { AST } from '#compiler' */
 /** @import { ComponentContext } from '../types' */
 import { is_ignored } from '../../../../state.js';
 import * as b from '#compiler/builders';
+import { build_expression } from './shared/utils.js';
 
 /**
  * @param {AST.HtmlTag} node
  * @param {ComponentContext} context
  */
 export function HtmlTag(node, context) {
-	context.state.template.push('<!>');
+	context.state.template.push_comment();
 
-	const expression = /** @type {Expression} */ (context.visit(node.expression));
+	const expression = build_expression(context, node.expression, node.metadata.expression);
 
 	const is_svg = context.state.metadata.namespace === 'svg';
 	const is_mathml = context.state.metadata.namespace === 'mathml';
